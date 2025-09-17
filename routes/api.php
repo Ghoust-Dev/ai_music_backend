@@ -4,6 +4,9 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\Api\DeviceController;
 use App\Http\Controllers\Api\MusicController;
+use App\Http\Controllers\Api\TaskController;
+use App\Http\Controllers\Api\ContentController;
+use App\Http\Controllers\Api\SubscriptionController;
 
 /*
 |--------------------------------------------------------------------------
@@ -68,13 +71,10 @@ Route::prefix('generate')->group(function () {
 */
 
 Route::prefix('task')->group(function () {
-    // Check task status
-    Route::get('/{taskId}/status', function ($taskId) {
-        return response()->json([
-            'task_id' => $taskId,
-            'message' => 'Task status endpoint - Coming in Phase 2'
-        ]);
-    });
+    Route::get('/{taskId}/status', [TaskController::class, 'getStatus']);
+    Route::post('/multiple-status', [TaskController::class, 'getMultipleStatus']);
+    Route::post('/{taskId}/cancel', [TaskController::class, 'cancelTask']);
+    Route::post('/{taskId}/retry', [TaskController::class, 'retryTask']);
 });
 
 /*
@@ -105,15 +105,11 @@ Route::prefix('files')->group(function () {
 */
 
 Route::prefix('content')->group(function () {
-    // List user's generated content
-    Route::get('/list', function () {
-        return response()->json(['message' => 'Content listing endpoint - Coming in Phase 2']);
-    });
-    
-    // Get user's usage stats
-    Route::get('/usage', function () {
-        return response()->json(['message' => 'Usage stats endpoint - Coming in Phase 2']);
-    });
+    Route::get('/list', [ContentController::class, 'list']);
+    Route::get('/usage', [ContentController::class, 'usage']);
+    Route::get('/{contentId}', [ContentController::class, 'show']);
+    Route::put('/{contentId}', [ContentController::class, 'update']);
+    Route::delete('/{contentId}', [ContentController::class, 'delete']);
 });
 
 /*
@@ -123,13 +119,6 @@ Route::prefix('content')->group(function () {
 */
 
 Route::prefix('subscription')->group(function () {
-    // Validate purchase receipt
-    Route::post('/validate', function () {
-        return response()->json(['message' => 'Purchase validation endpoint - Coming in Phase 4']);
-    });
-    
-    // Get subscription status
-    Route::get('/status', function () {
-        return response()->json(['message' => 'Subscription status endpoint - Coming in Phase 4']);
-    });
+    Route::post('/validate', [SubscriptionController::class, 'validatePurchase']);
+    Route::get('/status', [SubscriptionController::class, 'status']);
 });
