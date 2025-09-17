@@ -2,6 +2,8 @@
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\Api\DeviceController;
+use App\Http\Controllers\Api\MusicController;
 
 /*
 |--------------------------------------------------------------------------
@@ -40,15 +42,11 @@ Route::get('/test', function (Request $request) {
 */
 
 Route::prefix('device')->group(function () {
-    // Device registration - will be implemented in Phase 2
-    Route::post('/register', function () {
-        return response()->json(['message' => 'Device registration endpoint - Coming in Phase 2']);
-    });
-    
-    // Device info - will be implemented in Phase 2
-    Route::get('/info', function () {
-        return response()->json(['message' => 'Device info endpoint - Coming in Phase 2']);
-    });
+    Route::post('/register', [DeviceController::class, 'register']);
+    Route::get('/info', [DeviceController::class, 'info']);
+    Route::put('/update', [DeviceController::class, 'update']);
+    Route::get('/stats', [DeviceController::class, 'stats']);
+    Route::post('/can-perform', [DeviceController::class, 'canPerformAction']);
 });
 
 /*
@@ -58,20 +56,9 @@ Route::prefix('device')->group(function () {
 */
 
 Route::prefix('generate')->group(function () {
-    // Generate lyrics only
-    Route::post('/lyrics', function () {
-        return response()->json(['message' => 'Lyrics generation endpoint - Coming in Phase 2']);
-    });
-    
-    // Generate music/instrumental
-    Route::post('/music', function () {
-        return response()->json(['message' => 'Music generation endpoint - Coming in Phase 2']);
-    });
-    
-    // Generate vocals for existing music
-    Route::post('/singer', function () {
-        return response()->json(['message' => 'Singer generation endpoint - Coming in Phase 2']);
-    });
+    Route::post('/lyrics', [MusicController::class, 'generateLyrics']);
+    Route::post('/music', [MusicController::class, 'generateMusic']);
+    Route::post('/vocals', [MusicController::class, 'addVocals']);
 });
 
 /*
