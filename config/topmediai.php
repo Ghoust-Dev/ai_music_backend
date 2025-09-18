@@ -18,15 +18,15 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | API Endpoints
+    | API Endpoints (CORRECTED)
     |--------------------------------------------------------------------------
     */
 
     'endpoints' => [
-        'music' => '/v3/music',
-        'music_status' => '/v3/music/{task_id}',
+        'music' => '/v3/music/generate',           // ✅ FIXED: Added /generate
+        'music_status' => '/v3/music/tasks',       // ✅ FIXED: Changed to /tasks
         'lyrics' => '/v1/lyrics',
-        'singer' => '/v3/singer',
+        'singer' => '/v3/music/generate-singer',   // ✅ FIXED: Added /generate-singer
         'convert_mp4' => '/v3/convert-mp4',
         'convert_wav' => '/v3/convert-wav',
     ],

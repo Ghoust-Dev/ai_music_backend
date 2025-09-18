@@ -58,21 +58,32 @@ class TaskController extends Controller
 
             // Get fresh status from TopMediai if still processing
             if (in_array($content->status, ['pending', 'processing'])) {
-                $freshStatus = $this->taskService->checkTaskStatus($taskId);
-                
-                // Update content with fresh status
-                if ($freshStatus) {
-                    $content->update([
-                        'status' => $freshStatus['status'] ?? $content->status,
-                        'content_url' => $freshStatus['content_url'] ?? $content->content_url,
-                        'thumbnail_url' => $freshStatus['thumbnail_url'] ?? $content->thumbnail_url,
-                        'download_url' => $freshStatus['download_url'] ?? $content->download_url,
-                        'metadata' => array_merge($content->metadata ?? [], $freshStatus['metadata'] ?? []),
-                        'completed_at' => $freshStatus['status'] === 'completed' ? now() : $content->completed_at,
-                        'error_message' => $freshStatus['error_message'] ?? $content->error_message,
-                    ]);
+                try {
+                    $freshStatusResponse = $this->taskService->checkTaskStatus($taskId);
                     
-                    $content->refresh();
+                    // The new service returns multiple tasks, find our specific task
+                    if ($freshStatusResponse['success'] && !empty($freshStatusResponse['tasks'])) {
+                        $taskData = collect($freshStatusResponse['tasks'])
+                            ->firstWhere('task_id', $taskId);
+                        
+                        if ($taskData) {
+                            // Content is already updated by the service, just refresh
+                            $content->refresh();
+                            
+                            Log::info('Task status updated', [
+                                'task_id' => $taskId,
+                                'old_status' => $content->status,
+                                'new_status' => $taskData['status'],
+                                'has_audio' => !empty($taskData['audio_url'] ?? null)
+                            ]);
+                        }
+                    }
+                } catch (\Exception $e) {
+                    Log::warning('Failed to check fresh task status', [
+                        'task_id' => $taskId,
+                        'error' => $e->getMessage()
+                    ]);
+                    // Continue with cached status if API call fails
                 }
             }
 

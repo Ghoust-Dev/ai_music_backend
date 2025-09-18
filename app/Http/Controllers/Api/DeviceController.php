@@ -92,7 +92,7 @@ class DeviceController extends Controller
     }
 
     /**
-     * Get device information
+     * Get device information (with enhanced auto-registration)
      */
     public function info(Request $request): JsonResponse
     {
@@ -106,20 +106,34 @@ class DeviceController extends Controller
                 ], 400);
             }
 
-            $user = AiMusicUser::findByDeviceId($deviceId);
-            
-            if (!$user) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Device not found'
-                ], 404);
-            }
+            // Prepare enhanced device info for auto-registration
+            $deviceInfo = [
+                'platform' => $request->input('platform') ?? $request->header('X-Platform') ?? 'unknown',
+                'app_version' => $request->input('version') ?? $request->header('X-App-Version') ?? 'unknown',
+                'device_model' => $request->input('model') ?? $request->header('X-Device-Model') ?? 'unknown',
+                'os_version' => $request->input('os_version') ?? $request->header('X-OS-Version') ?? null,
+                'user_agent' => $request->userAgent(),
+                'ip_address' => $request->ip(),
+                'auto_created_at' => now()->toISOString(),
+            ];
+
+            // Find or create user (enhanced auto-registration)
+            $user = AiMusicUser::findOrCreateByDeviceId($deviceId, $deviceInfo);
 
             // Update last active
             $user->update(['last_active_at' => now()]);
 
             // Reset monthly usage if needed
             $user->resetMonthlyUsageIfNeeded();
+
+            Log::info('Device info retrieved/auto-registered', [
+                'device_id' => $deviceId,
+                'user_id' => $user->id,
+                'platform' => $deviceInfo['platform'],
+                'app_version' => $deviceInfo['app_version'],
+                'device_model' => $deviceInfo['device_model'],
+                'was_created' => $user->wasRecentlyCreated
+            ]);
 
             return response()->json([
                 'success' => true,

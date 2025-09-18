@@ -47,9 +47,6 @@ Route::get('/test', function (Request $request) {
 Route::prefix('device')->group(function () {
     Route::post('/register', [DeviceController::class, 'register']);
     Route::get('/info', [DeviceController::class, 'info']);
-    Route::put('/update', [DeviceController::class, 'update']);
-    Route::get('/stats', [DeviceController::class, 'stats']);
-    Route::post('/can-perform', [DeviceController::class, 'canPerformAction']);
 });
 
 /*
