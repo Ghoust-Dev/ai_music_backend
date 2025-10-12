@@ -22,3 +22,17 @@
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+# Custom Ignores
+PAYWALL_IMPLEMENTATION_PLAN.md
+FLUTTER_PAYWALL_INTEGRATION.md
+
+# Documentation files (exclude all .md except README.md)
+*.md
+!README.md
+
+# Text and script files
+*.txt
+*.bat
+*.ps1
+*.sh

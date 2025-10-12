@@ -14,6 +14,7 @@ class GeneratedContent extends Model
 
     protected $fillable = [
         'user_id',
+        'generation_id',  // ✅ ADDED: Links content to generation
         'title',
         'content_type',
         'topmediai_task_id',
@@ -25,7 +26,13 @@ class GeneratedContent extends Model
         'language',
         'duration',
         'content_url',
+        'streaming_url',  // ✅ ADDED: For temporary processing URLs
         'thumbnail_url',
+        'custom_thumbnail_url',  // ✅ ADDED: High-res Runware thumbnail
+        'thumbnail_generation_status',  // ✅ ADDED: Thumbnail generation status
+        'thumbnail_prompt_used',  // ✅ ADDED: Prompt used for thumbnail
+        'thumbnail_retry_count',  // ✅ ADDED: Thumbnail retry attempts
+        'thumbnail_completed_at',  // ✅ ADDED: Thumbnail completion time
         'download_url',
         'preview_url',
         'metadata',
@@ -35,6 +42,8 @@ class GeneratedContent extends Model
         'retry_count',
         'is_premium_generation',
         'last_accessed_at',
+        'is_trashed',  // ✅ ADDED: Trash flag for soft delete
+        'trashed_at',  // ✅ ADDED: Timestamp when song was trashed
     ];
 
     protected $casts = [
@@ -43,8 +52,26 @@ class GeneratedContent extends Model
         'started_at' => 'datetime',
         'completed_at' => 'datetime',
         'last_accessed_at' => 'datetime',
+        'thumbnail_completed_at' => 'datetime',  // ✅ ADDED: Thumbnail completion time
+        'trashed_at' => 'datetime',  // ✅ ADDED: Trashed timestamp
         'is_premium_generation' => 'boolean',
+        'is_trashed' => 'boolean',  // ✅ ADDED: Trash flag
     ];
+
+    /**
+     * Boot the model to auto-update generation status
+     */
+    protected static function boot()
+    {
+        parent::boot();
+        
+        static::updated(function ($content) {
+            // Update generation status when content status changes
+            if ($content->isDirty('status') && $content->generation) {
+                $content->generation->updateStatus();
+            }
+        });
+    }
 
     /**
      * Get the user that owns this content
@@ -52,6 +79,14 @@ class GeneratedContent extends Model
     public function user(): BelongsTo
     {
         return $this->belongsTo(AiMusicUser::class, 'user_id');
+    }
+
+    /**
+     * Get the generation that owns this content
+     */
+    public function generation(): BelongsTo
+    {
+        return $this->belongsTo(Generation::class);
     }
 
     /**
@@ -111,6 +146,22 @@ class GeneratedContent extends Model
     }
 
     /**
+     * Check if content has a streaming URL available (for processing status)
+     */
+    public function hasStreamingUrl(): bool
+    {
+        return !empty($this->streaming_url);
+    }
+
+    /**
+     * Get the streaming URL for processing content
+     */
+    public function getStreamingUrl(): ?string
+    {
+        return $this->streaming_url;
+    }
+
+    /**
      * Get formatted duration
      */
     public function getFormattedDuration(): string
@@ -147,6 +198,16 @@ class GeneratedContent extends Model
     public function markAsAccessed(): void
     {
         $this->update(['last_accessed_at' => now()]);
+    }
+
+    /**
+     * Update generation status when content status changes
+     */
+    public function updateGenerationStatus(): void
+    {
+        if ($this->generation) {
+            $this->generation->updateStatus();
+        }
     }
 
     /**
@@ -187,6 +248,14 @@ class GeneratedContent extends Model
     public function scopeForUser($query, int $userId)
     {
         return $query->where('user_id', $userId);
+    }
+
+    /**
+     * Scope: Filter by generation
+     */
+    public function scopeForGeneration($query, int $generationId)
+    {
+        return $query->where('generation_id', $generationId);
     }
 
     /**
@@ -305,5 +374,43 @@ class GeneratedContent extends Model
             'mood' => $this->mood,
             'created_at' => $this->created_at->format('Y-m-d'),
         ];
+    }
+
+    /**
+     * Check if custom high-resolution thumbnail is available
+     */
+    public function hasCustomThumbnail(): bool
+    {
+        return $this->thumbnail_generation_status === 'completed' && !empty($this->custom_thumbnail_url);
+    }
+
+    /**
+     * Get the best available thumbnail URL (prefer custom high-res)
+     */
+    public function getBestThumbnailUrl(): ?string
+    {
+        // Prefer custom high-resolution thumbnail from Runware
+        if ($this->hasCustomThumbnail()) {
+            return $this->custom_thumbnail_url;
+        }
+        
+        // Fallback to original TopMediai thumbnail (low quality)
+        return $this->thumbnail_url;
+    }
+
+    /**
+     * Check if thumbnail generation is still in progress
+     */
+    public function isThumbnailGenerating(): bool
+    {
+        return in_array($this->thumbnail_generation_status, ['pending', 'processing']);
+    }
+
+    /**
+     * Check if thumbnail generation has failed
+     */
+    public function hasThumbnailFailed(): bool
+    {
+        return $this->thumbnail_generation_status === 'failed';
     }
 }

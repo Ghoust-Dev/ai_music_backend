@@ -170,10 +170,9 @@ class TaskStatusService extends TopMediaiBaseService
     protected function prepareCleanTaskData(array $taskData, string $status): array
     {
         $duration = $taskData['duration'] ?? -1;
-        $taskId = $taskData['id'] ?? 'unknown';
         
         $clean = [
-            'task_id' => $taskId,
+            'task_id' => $taskData['id'] ?? 'unknown',
             'status' => $status,
             'title' => $taskData['title'] ?? 'Untitled',
             'style' => $taskData['style'] ?? null,
@@ -183,24 +182,12 @@ class TaskStatusService extends TopMediaiBaseService
             'is_truly_completed' => ($status === 'completed' && $duration > 0), // Clear completion indicator
         ];
 
-        // 🎨 ENHANCED: Fetch GeneratedContent data for thumbnail information
-        $generatedContent = \App\Models\GeneratedContent::where('topmediai_task_id', $taskId)->first();
-        
-        // Add streaming URL if processing and available
-        if ($status === 'processing' && !empty($taskData['audio_url'])) {
-            $clean['streaming_url'] = $taskData['audio_url'];
-        } else {
-            $clean['streaming_url'] = $generatedContent?->streaming_url ?? null;
-        }
-
         // Add URLs if completed
         if ($status === 'completed') {
             $clean['audio_url'] = $taskData['audio_url'] ?? null;
             $clean['cover_url'] = $taskData['cover_url'] ?? null;
             $clean['lyrics'] = $taskData['lyric'] ?? null;
             $clean['song_id'] = $taskData['song_id'] ?? null;
-            // Clear streaming URL when completed
-            $clean['streaming_url'] = null;
         }
 
         // Add error info if failed
@@ -208,43 +195,6 @@ class TaskStatusService extends TopMediaiBaseService
             $clean['fail_code'] = $taskData['fail_code'] ?? null;
             $clean['fail_reason'] = $taskData['fail_reason'] ?? 'Generation failed';
             $clean['error_message'] = $taskData['fail_reason'] ?? 'Music generation failed';
-            // Clear streaming URL when failed
-            $clean['streaming_url'] = null;
-        }
-
-        // 🎨 ENHANCED: Always include thumbnail data from database
-        if ($generatedContent) {
-            $clean['custom_thumbnail_url'] = $generatedContent->custom_thumbnail_url;
-            $clean['best_thumbnail_url'] = $generatedContent->getBestThumbnailUrl();
-            $clean['thumbnail_status'] = $generatedContent->thumbnail_generation_status;
-            $clean['thumbnail_info'] = [
-                'status' => $generatedContent->thumbnail_generation_status,
-                'is_generating' => $generatedContent->isThumbnailGenerating(),
-                'has_custom' => $generatedContent->hasCustomThumbnail(),
-                'has_failed' => $generatedContent->hasThumbnailFailed(),
-                'retry_count' => $generatedContent->thumbnail_retry_count,
-                'completed_at' => $generatedContent->thumbnail_completed_at,
-            ];
-            
-            // Include additional database fields if available
-            $clean['content_id'] = $generatedContent->id;
-            $clean['generation_id'] = $generatedContent->generation_id;
-            $clean['prompt'] = $generatedContent->prompt;
-            $clean['genre'] = $generatedContent->genre;
-            $clean['mood'] = $generatedContent->mood;
-        } else {
-            // Default thumbnail data if no database record found
-            $clean['custom_thumbnail_url'] = null;
-            $clean['best_thumbnail_url'] = null;
-            $clean['thumbnail_status'] = 'pending';
-            $clean['thumbnail_info'] = [
-                'status' => 'pending',
-                'is_generating' => false,
-                'has_custom' => false,
-                'has_failed' => false,
-                'retry_count' => 0,
-                'completed_at' => null,
-            ];
         }
 
         return $clean;
@@ -342,17 +292,6 @@ class TaskStatusService extends TopMediaiBaseService
             ])
         ];
 
-        // If processing and has audio_url, save it as streaming_url
-        if ($status === 'processing' && !empty($taskData['audio_url'])) {
-            $updateData['streaming_url'] = $taskData['audio_url'];
-            
-            Log::info('Streaming URL available for processing task', [
-                'content_id' => $content->id,
-                'task_id' => $taskData['id'] ?? 'unknown',
-                'streaming_url' => $taskData['audio_url']
-            ]);
-        }
-
         // If completed, extract URLs and metadata
         if ($status === 'completed') {
             $updateData['content_url'] = $taskData['audio_url'] ?? null;
@@ -360,9 +299,6 @@ class TaskStatusService extends TopMediaiBaseService
             $updateData['download_url'] = $taskData['audio_url'] ?? null;
             $updateData['preview_url'] = $taskData['audio_url'] ?? null;
             $updateData['completed_at'] = now();
-            
-            // Clear streaming_url when completed (no longer needed)
-            $updateData['streaming_url'] = null;
             
             // Extract additional metadata
             if (isset($taskData['duration'])) {
@@ -386,10 +322,9 @@ class TaskStatusService extends TopMediaiBaseService
             ]);
         }
 
-        // If failed, record error and clear streaming_url
+        // If failed, record error
         if ($status === 'failed') {
             $updateData['error_message'] = $taskData['fail_reason'] ?? 'Generation failed';
-            $updateData['streaming_url'] = null; // Clear any existing streaming URL
         }
 
         $content->update($updateData);
@@ -398,8 +333,7 @@ class TaskStatusService extends TopMediaiBaseService
             'content_id' => $content->id,
             'task_id' => $taskData['id'] ?? 'unknown',
             'status' => $status,
-            'has_urls' => isset($updateData['content_url']),
-            'has_streaming_url' => !empty($updateData['streaming_url'])
+            'has_urls' => isset($updateData['content_url'])
         ]);
     }
 

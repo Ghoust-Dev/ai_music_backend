@@ -42,10 +42,12 @@ class SubscriptionController extends Controller
                 'success' => true,
                 'data' => [
                     'user_info' => [
-                        'subscription_status' => $user->subscription_status,
+                        'subscription_credits' => $user->subscription_credits,
+                        'addon_credits' => $user->addon_credits,
+                        'total_credits' => $user->totalCredits(),
+                        'has_active_subscription' => $user->hasActiveSubscription(),
+                        'subscription_expires_at' => $user->subscription_expires_at,
                         'is_premium' => $user->isPremium(),
-                        'usage_count' => $user->usage_count,
-                        'monthly_usage' => $user->monthly_usage,
                         'can_generate' => $user->canGenerate(),
                         'remaining_generations' => $user->remainingGenerations(),
                     ],

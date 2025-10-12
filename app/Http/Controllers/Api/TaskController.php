@@ -103,6 +103,7 @@ class TaskController extends Controller
                     'estimated_completion' => $this->getEstimatedCompletion($content),
                     'content_urls' => [
                         'content_url' => $content->content_url,
+                        'streaming_url' => $content->streaming_url,
                         'thumbnail_url' => $content->thumbnail_url,
                         'download_url' => $content->download_url,
                         'preview_url' => $content->preview_url,
@@ -128,6 +129,195 @@ class TaskController extends Controller
                 'error' => config('app.debug') ? $e->getMessage() : 'Internal server error'
             ], 500);
         }
+    }
+
+    /**
+     * Get status for multiple tasks at once
+     */
+    public function getMultipleStatus(Request $request): JsonResponse
+    {
+        try {
+            $request->validate([
+                'task_ids' => 'required|array|min:1|max:10',
+                'task_ids.*' => 'required|string'
+            ]);
+
+            $deviceId = $request->header('X-Device-ID');
+            
+            if (!$deviceId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Device ID is required'
+                ], 400);
+            }
+
+            // Find user
+            $user = AiMusicUser::findByDeviceId($deviceId);
+            if (!$user) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Device not registered'
+                ], 404);
+            }
+
+            $taskIds = $request->input('task_ids');
+            
+            // Find all content belonging to this user
+            $contents = GeneratedContent::whereIn('topmediai_task_id', $taskIds)
+                ->where('user_id', $user->id)
+                ->get()
+                ->keyBy('topmediai_task_id');
+
+            // Check if we need to fetch fresh status for any processing tasks
+            $processingTaskIds = $contents->filter(function ($content) {
+                return in_array($content->status, ['pending', 'processing']);
+            })->pluck('topmediai_task_id')->toArray();
+
+            if (!empty($processingTaskIds)) {
+                try {
+                    $freshStatusResponse = $this->taskService->checkTaskStatus(implode(',', $processingTaskIds));
+                    
+                    if ($freshStatusResponse['success']) {
+                        // Refresh the content models to get updated data
+                        $contents = GeneratedContent::whereIn('topmediai_task_id', $taskIds)
+                            ->where('user_id', $user->id)
+                            ->get()
+                            ->keyBy('topmediai_task_id');
+                    }
+                } catch (\Exception $e) {
+                    Log::warning('Failed to check fresh status for multiple tasks', [
+                        'task_ids' => $processingTaskIds,
+                        'error' => $e->getMessage()
+                    ]);
+                }
+            }
+
+            // Prepare response data
+            $tasks = [];
+            $completedCount = 0;
+            $failedCount = 0;
+            $processingCount = 0;
+
+            foreach ($taskIds as $taskId) {
+                $content = $contents->get($taskId);
+                
+                if (!$content) {
+                    $tasks[] = [
+                        'task_id' => $taskId,
+                        'status' => 'not_found',
+                        'message' => 'Task not found or not accessible'
+                    ];
+                    continue;
+                }
+
+                // Update last accessed
+                $content->update(['last_accessed_at' => now()]);
+
+                $taskData = [
+                    'task_id' => $content->topmediai_task_id,
+                    'content_id' => $content->id,
+                    'status' => $content->status,
+                    'title' => $content->title,
+                    'content_type' => $content->content_type,
+                    'prompt' => $content->prompt,
+                    'progress' => $this->calculateProgress($content),
+                    'created_at' => $content->created_at,
+                ];
+
+                // Add completion data if completed
+                if ($content->status === 'completed') {
+                    $taskData = array_merge($taskData, [
+                        'duration' => $content->duration,
+                        'audio_url' => $content->content_url,
+                        'streaming_url' => null, // Always null when completed
+                        'cover_url' => $content->thumbnail_url,
+                        'custom_thumbnail_url' => $content->custom_thumbnail_url,  // ✅ High-res Runware thumbnail
+                        'best_thumbnail_url' => $content->getBestThumbnailUrl(),  // ✅ Helper method
+                        'thumbnail_status' => $content->thumbnail_generation_status,  // ✅ Thumbnail status
+                        'download_url' => $content->download_url,
+                        'preview_url' => $content->preview_url,
+                        'completed_at' => $content->completed_at,
+                    ]);
+
+                    // Extract additional data from metadata
+                    $metadata = $content->metadata ?? [];
+                    if (isset($metadata['lyrics'])) {
+                        $taskData['lyrics'] = $metadata['lyrics'];
+                    }
+                    if (isset($metadata['song_id'])) {
+                        $taskData['song_id'] = $metadata['song_id'];
+                    }
+                    if (isset($metadata['style'])) {
+                        $taskData['style'] = $metadata['style'];
+                    }
+
+                    $completedCount++;
+                } elseif ($content->status === 'failed') {
+                    $taskData['error_message'] = $content->error_message;
+                    $failedCount++;
+                } elseif (in_array($content->status, ['pending', 'processing'])) {
+                    $taskData['estimated_completion'] = $this->getEstimatedCompletion($content);
+                    $taskData['streaming_url'] = $content->streaming_url; // Include streaming URL for processing tasks
+                    // Add thumbnail info for processing tasks too
+                    $taskData['custom_thumbnail_url'] = $content->custom_thumbnail_url;  // ✅ High-res Runware thumbnail
+                    $taskData['best_thumbnail_url'] = $content->getBestThumbnailUrl();  // ✅ Helper method
+                    $taskData['thumbnail_status'] = $content->thumbnail_generation_status;  // ✅ Thumbnail status
+                    $processingCount++;
+                }
+
+                $tasks[] = $taskData;
+            }
+
+            // Determine overall status
+            $overallStatus = $this->determineOverallStatus($tasks);
+
+            return response()->json([
+                'success' => true,
+                'overall_status' => $overallStatus,
+                'tasks' => $tasks,
+                'summary' => [
+                    'total_tasks' => count($tasks),
+                    'completed_tasks' => $completedCount,
+                    'failed_tasks' => $failedCount,
+                    'processing_tasks' => $processingCount,
+                    'not_found_tasks' => count($taskIds) - count($contents)
+                ]
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Multiple task status check failed', [
+                'error' => $e->getMessage(),
+                'device_id' => $deviceId ?? 'unknown'
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to get task status',
+                'error' => config('app.debug') ? $e->getMessage() : 'Internal server error'
+            ], 500);
+        }
+    }
+
+    /**
+     * Determine overall status from task array
+     */
+    private function determineOverallStatus(array $tasks): string
+    {
+        $statuses = array_column($tasks, 'status');
+        
+        if (in_array('failed', $statuses)) {
+            return 'failed';
+        }
+        
+        if (in_array('processing', $statuses) || in_array('pending', $statuses)) {
+            return 'processing';
+        }
+        
+        if (!empty($statuses) && array_unique($statuses) === ['completed']) {
+            return 'completed';
+        }
+        
+        return 'mixed';
     }
 
     /**

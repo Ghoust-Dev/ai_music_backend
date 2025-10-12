@@ -13,10 +13,9 @@ class AiMusicUser extends Model
     protected $fillable = [
         'device_id',
         'device_fingerprint',
-        'subscription_status',
-        'usage_count',
-        'monthly_usage',
-        'usage_reset_date',
+        'subscription_credits',
+        'addon_credits',
+        'subscription_expires_at',
         'last_active_at',
         'device_info',
     ];
@@ -24,7 +23,7 @@ class AiMusicUser extends Model
     protected $casts = [
         'device_info' => 'array',
         'last_active_at' => 'datetime',
-        'usage_reset_date' => 'date',
+        'subscription_expires_at' => 'datetime',
     ];
 
     /**
@@ -44,69 +43,152 @@ class AiMusicUser extends Model
     }
 
     /**
-     * Get subscriptions for this user
+     * Get purchases for this user
      */
-    public function subscriptions(): HasMany
+    public function purchases(): HasMany
     {
-        return $this->hasMany(Subscription::class, 'user_id');
+        return $this->hasMany(Purchase::class, 'user_id');
     }
 
     /**
-     * Get active subscription
+     * Check if user has an active subscription
      */
-    public function activeSubscription()
+    public function hasActiveSubscription(): bool
     {
-        return $this->subscriptions()
-            ->where('status', 'active')
-            ->where('expires_at', '>', now())
-            ->first();
+        return $this->subscription_expires_at !== null && $this->subscription_expires_at->isFuture();
     }
 
     /**
-     * Check if user is premium
+     * Get total available credits
      */
-    public function isPremium(): bool
+    public function totalCredits(): int
     {
-        return $this->subscription_status === 'premium' || $this->activeSubscription() !== null;
+        return $this->subscription_credits + $this->addon_credits;
     }
 
     /**
-     * Check if user can generate content
+     * Check if user can generate content (has any credits)
      */
     public function canGenerate(): bool
     {
-        if ($this->isPremium()) {
-            return true;
-        }
-
-        $freeLimit = config('topmediai.subscription.free_tier_limit', 10);
-        return $this->usage_count < $freeLimit;
+        return $this->totalCredits() > 0;
     }
 
     /**
-     * Get remaining free generations
+     * Get remaining credits (backward compatibility)
+     */
+    public function remainingCredits(): int
+    {
+        return $this->totalCredits();
+    }
+
+    /**
+     * Decrement credits with priority: subscription first, then addon
+     */
+    public function decrementCredits(int $amount = 1): bool
+    {
+        if ($this->totalCredits() < $amount) {
+            return false;
+        }
+
+        $remaining = $amount;
+        
+        // First consume subscription credits
+        if ($this->subscription_credits > 0) {
+            $consumeFromSubscription = min($this->subscription_credits, $remaining);
+            $this->decrement('subscription_credits', $consumeFromSubscription);
+            $remaining -= $consumeFromSubscription;
+        }
+        
+        // Then consume addon credits if needed
+        if ($remaining > 0 && $this->addon_credits > 0) {
+            $this->decrement('addon_credits', $remaining);
+        }
+        
+        return true;
+    }
+
+    /**
+     * Add subscription credits (expire with subscription)
+     */
+    public function addSubscriptionCredits(int $amount): void
+    {
+        $this->increment('subscription_credits', $amount);
+    }
+
+    /**
+     * Add addon credits (lifetime)
+     */
+    public function addAddonCredits(int $amount): void
+    {
+        $this->increment('addon_credits', $amount);
+    }
+
+    /**
+     * Add credits to user balance (backward compatibility)
+     */
+    public function addCredits(int $amount): void
+    {
+        $this->addSubscriptionCredits($amount);
+    }
+
+    /**
+     * Check if user is premium (backward compatibility)
+     */
+    public function isPremium(): bool
+    {
+        return $this->hasActiveSubscription();
+    }
+
+    /**
+     * Get active subscription (backward compatibility)
+     */
+    public function activeSubscription()
+    {
+        // For backward compatibility, return a mock subscription object
+        // This will be replaced when we implement the full purchase system
+        if ($this->hasActiveSubscription()) {
+            return (object) [
+                'id' => 'credit_based',
+                'subscription_type' => 'credit_based',
+                'status' => 'active',
+                'platform' => 'app',
+                'starts_at' => $this->created_at,
+                'expires_at' => $this->subscription_expires_at,
+                'auto_renewal' => false,
+                'generations_included' => $this->subscription_credits,
+                'generations_used' => 0,
+                'features_enabled' => ['music_generation'],
+                'subscription_expires_at' => $this->subscription_expires_at,
+            ];
+        }
+        return null;
+    }
+
+    /**
+     * Get remaining generations (backward compatibility)
      */
     public function remainingGenerations(): int
     {
-        if ($this->isPremium()) {
-            return -1; // Unlimited
-        }
-
-        $freeLimit = config('topmediai.subscription.free_tier_limit', 10);
-        return max(0, $freeLimit - $this->usage_count);
+        return $this->totalCredits();
     }
 
     /**
-     * Reset monthly usage if needed
+     * Set subscription expiration (for testing purposes)
      */
-    public function resetMonthlyUsageIfNeeded(): void
+    public function setSubscriptionExpiration(\DateTime|string|null $expiresAt): void
     {
-        if ($this->usage_reset_date < now()->startOfMonth()) {
-            $this->update([
-                'monthly_usage' => 0,
-                'usage_reset_date' => now()->startOfMonth()->toDateString(),
-            ]);
-        }
+        $this->update([
+            'subscription_expires_at' => $expiresAt
+        ]);
+    }
+
+    /**
+     * Check if subscription is expired
+     */
+    public function isSubscriptionExpired(): bool
+    {
+        return $this->subscription_expires_at !== null && $this->subscription_expires_at->isPast();
     }
 
     /**
@@ -128,10 +210,9 @@ class AiMusicUser extends Model
             $user = self::create([
                 'device_id' => $deviceId,
                 'device_fingerprint' => md5($deviceId . config('topmediai.device_tracking.salt', 'default')),
-                'subscription_status' => 'free',
-                'usage_count' => 0,
-                'monthly_usage' => 0,
-                'usage_reset_date' => now()->startOfMonth()->toDateString(),
+                'subscription_credits' => 0, // New users start with 0 credits (must purchase subscription)
+                'addon_credits' => 0,
+                'subscription_expires_at' => null,
                 'last_active_at' => now(),
                 'device_info' => $deviceInfo,
             ]);
@@ -144,5 +225,18 @@ class AiMusicUser extends Model
         }
 
         return $user;
+    }
+
+    /**
+     * Reset monthly usage if needed
+     * 
+     * Note: Currently a no-op as monthly usage tracking is handled
+     * at the subscription level in the subscriptions table.
+     * The ai_music_users table only stores current credit balances.
+     */
+    public function resetMonthlyUsageIfNeeded(): void
+    {
+        // No-op: Monthly usage tracking is handled by the subscriptions table
+        // The ai_music_users table only tracks current credits, not monthly limits
     }
 }

@@ -57,8 +57,7 @@ class DeviceController extends Controller
                 'is_new_user' => $user->wasRecentlyCreated
             ]);
 
-            // Reset monthly usage if needed
-            $user->resetMonthlyUsageIfNeeded();
+            // Note: Monthly usage reset no longer needed with credit-based system
 
             return response()->json([
                 'success' => true,
@@ -66,9 +65,11 @@ class DeviceController extends Controller
                 'data' => [
                     'user_id' => $user->id,
                     'device_id' => $user->device_id,
-                    'subscription_status' => $user->subscription_status,
-                    'usage_count' => $user->usage_count,
-                    'monthly_usage' => $user->monthly_usage,
+                    'subscription_credits' => $user->subscription_credits,
+                    'addon_credits' => $user->addon_credits,
+                    'total_credits' => $user->totalCredits(),
+                    'has_active_subscription' => $user->hasActiveSubscription(),
+                    'subscription_expires_at' => $user->subscription_expires_at,
                     'can_generate' => $user->canGenerate(),
                     'remaining_generations' => $user->remainingGenerations(),
                     'is_premium' => $user->isPremium(),
@@ -140,9 +141,11 @@ class DeviceController extends Controller
                 'data' => [
                     'user_id' => $user->id,
                     'device_id' => $user->device_id,
-                    'subscription_status' => $user->subscription_status,
-                    'usage_count' => $user->usage_count,
-                    'monthly_usage' => $user->monthly_usage,
+                    'subscription_credits' => $user->subscription_credits,
+                    'addon_credits' => $user->addon_credits,
+                    'total_credits' => $user->totalCredits(),
+                    'has_active_subscription' => $user->hasActiveSubscription(),
+                    'subscription_expires_at' => $user->subscription_expires_at,
                     'can_generate' => $user->canGenerate(),
                     'remaining_generations' => $user->remainingGenerations(),
                     'is_premium' => $user->isPremium(),

@@ -64,7 +64,7 @@ return [
     */
 
     'subscription' => [
-        'free_tier_limit' => (int) env('FREE_TIER_LIMIT', 10),
+        'free_tier_limit' => (int) env('FREE_TIER_LIMIT', 100),
         'premium_features_enabled' => (bool) env('PREMIUM_FEATURES_ENABLED', true),
     ],
 

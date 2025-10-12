@@ -5,18 +5,45 @@ namespace App\Services;
 use App\Models\GeneratedContent;
 use App\Models\GenerationRequest;
 use App\Models\AiMusicUser;
+use App\Models\Generation;
+use App\Jobs\CheckTaskStatusJob;
+use App\Jobs\ThumbnailGenerationJob;
 use Illuminate\Support\Facades\Log;
 use Exception;
 
 class MusicGenerationService extends TopMediaiBaseService
 {
+    protected GenerationModeService $modeService;
+    protected TitleGenerationService $titleService;
+    protected ErrorHandlingService $errorService;
+
+    public function __construct()
+    {
+        parent::__construct();
+        $this->modeService = new GenerationModeService();
+        $this->titleService = new TitleGenerationService();
+        $this->errorService = new ErrorHandlingService();
+    }
+
     /**
-     * Generate music using TopMediai V3 API
+     * Generate music using TopMediai V3 API with mode detection
      */
     public function generateMusic(array $params): array
     {
-        // Validate required parameters
-        $this->validateRequired($params, ['prompt']);
+        // PHASE 3: Detect generation mode
+        $mode = $this->modeService->detectMode($params);
+        
+        Log::info('Generation mode detected', [
+            'mode' => $mode,
+            'description' => $this->modeService->getModeDescription($mode),
+            'params_keys' => array_keys($params)
+        ]);
+
+        // PHASE 3: Validate parameters for the detected mode
+        $validationErrors = $this->modeService->validateModeParams($params, $mode);
+        if (!empty($validationErrors)) {
+            throw new Exception('Validation failed: ' . implode(', ', $validationErrors));
+        }
         
         // Validate user exists
         if (isset($params['user_id'])) {
@@ -26,17 +53,21 @@ class MusicGenerationService extends TopMediaiBaseService
             }
         }
 
-        // Prepare request data for TopMediai V3
-        $requestData = $this->prepareRequestData($params);
+        // PHASE 2: Create generation record first
+        $generation = $this->createGeneration($params, $mode);
+
+        // PHASE 3: Build TopMediai request based on mode
+        $requestData = $this->modeService->buildTopMediaiRequest($params, $mode);
         
         Log::info('Starting music generation', [
+            'generation_id' => $generation->generation_id,
+            'mode' => $mode,
             'user_id' => $params['user_id'] ?? null,
-            'prompt' => $params['prompt'],
             'request_data' => $requestData
         ]);
 
         // Record generation request
-        $generationRequest = $this->recordGenerationRequest($params, $requestData);
+        $generationRequest = $this->recordGenerationRequest($params, $requestData, $generation);
 
         try {
             // Call TopMediai V3 music endpoint
@@ -45,7 +76,7 @@ class MusicGenerationService extends TopMediaiBaseService
             Log::info('TopMediai API Response', [
                 'status' => $response['status'] ?? 'unknown',
                 'has_data' => isset($response['data']) && !empty($response['data']),
-                'generation_request_id' => $generationRequest->id
+                'generation_id' => $generation->generation_id
             ]);
             
             // Check TopMediai response status
@@ -53,7 +84,7 @@ class MusicGenerationService extends TopMediaiBaseService
             
             if ($topMediaiStatus === 200) {
                 // SUCCESS: Extract task IDs and save them
-                return $this->handleSuccessfulResponse($response, $generationRequest, $params);
+                return $this->handleSuccessfulResponse($response, $generationRequest, $params, $generation);
             } else {
                 // ERROR: Return user-friendly error message
                 return $this->handleErrorResponse($response, $generationRequest, $topMediaiStatus);
@@ -65,66 +96,102 @@ class MusicGenerationService extends TopMediaiBaseService
     }
 
     /**
-     * Prepare request data for TopMediai V3
+     * PHASE 2: Create generation record
      */
-    protected function prepareRequestData(array $params): array
+    protected function createGeneration(array $params, string $mode): Generation
     {
-        // Based on TopMediai V3 official documentation
-        // https://docs.topmediai.com/api-reference/ai-music-generator/v3-generate-music
-        
-        // For auto generation (style-based)
-        if (isset($params['use_auto']) && $params['use_auto']) {
-            $requestData = [
-                'action' => 'auto',
-                'style' => $params['prompt'], // Use prompt as style description
-                'mv' => $params['model_version'] ?? 'v4.0',
-                'instrumental' => isset($params['is_instrumental']) && $params['is_instrumental'] ? 1 : 0,
-                'gender' => $params['gender'] ?? 'male'
-            ];
-        } else {
-            // For custom generation (lyrics + style)
-            $requestData = [
-                'action' => 'custom',
-                'style' => $this->generateStyleFromPrompt($params),
-                'lyrics' => $params['lyrics'] ?? $params['prompt'],
-                'mv' => $params['model_version'] ?? 'v4.0',
-                'instrumental' => isset($params['is_instrumental']) && $params['is_instrumental'] ? 1 : 0,
-                'gender' => $params['gender'] ?? 'male'
-            ];
+        $user = null;
+        if (isset($params['user_id'])) {
+            $user = AiMusicUser::find($params['user_id']);
         }
 
-        Log::info('TopMediai Request Data (Official Format)', $requestData);
-
-        return $requestData;
+        return Generation::create([
+            'device_id' => $params['device_id'] ?? 'unknown',
+            'user_id' => $user ? $user->id : null,
+            'mode' => $mode,
+            'request_data' => $params,
+            'estimated_time' => $this->calculateEstimatedTime($params, $mode),
+            'status' => 'processing',
+            'task_count' => 2, // TopMediai always returns 2 tasks
+        ]);
     }
 
     /**
-     * Generate style description from prompt, mood, and genre
+     * Calculate realistic estimated time based on audio duration and complexity
      */
-    protected function generateStyleFromPrompt(array $params): string
+    protected function calculateEstimatedTime(array $params, string $mode): string
     {
-        $style = $params['prompt'];
+        $duration = $params['duration'] ?? 120; // Audio duration in seconds
+        $complexity = $this->getComplexityScore($params, $mode);
         
-        if (isset($params['mood']) && !empty($params['mood'])) {
-            $style .= " in a " . $params['mood'] . " mood";
-        }
+        // Base formula: 3-8x the audio duration depending on complexity
+        $multiplier = 3 + ($complexity * 1.5); // 3x to 8x multiplier
+        $estimatedSeconds = $duration * $multiplier;
         
-        if (isset($params['genre']) && !empty($params['genre'])) {
-            $style .= " in " . $params['genre'] . " style";
-        }
+        // Add server load buffer (40% extra for TopMediai variability)
+        $bufferMultiplier = 1.4;
+        $totalSeconds = $estimatedSeconds * $bufferMultiplier;
         
-        return $style;
+        $minutes = ceil($totalSeconds / 60);
+        
+        return match(true) {
+            $minutes <= 3 => "2-3 minutes",
+            $minutes <= 6 => "4-6 minutes", 
+            $minutes <= 10 => "7-10 minutes",
+            $minutes <= 15 => "10-15 minutes",
+            default => "15+ minutes"
+        };
     }
 
     /**
-     * Record generation request in database
+     * Calculate complexity score based on generation parameters
      */
-    protected function recordGenerationRequest(array $params, array $requestData): GenerationRequest
+    protected function getComplexityScore(array $params, string $mode): float
+    {
+        $score = 0.0;
+        
+        // Base complexity by mode
+        $score += match($mode) {
+            'instrumental' => 1.0,      // Simplest
+            'text_to_song' => 2.0,      // Medium complexity
+            'lyrics_to_song' => 3.0,    // Most complex
+            default => 2.0
+        };
+        
+        // Instrument count complexity
+        $instrumentCount = count($params['instruments'] ?? []);
+        $score += min($instrumentCount * 0.3, 2.0); // Max 2 points for instruments
+        
+        // Duration complexity (longer = more processing)
+        $duration = $params['duration'] ?? 120;
+        if ($duration > 180) {
+            $score += 0.5; // 3+ minutes = more complex
+        }
+        if ($duration > 240) {
+            $score += 0.5; // 4+ minutes = even more complex
+        }
+        
+        // Quality/environment complexity
+        $environment = $params['recording_environment'] ?? '';
+        if (in_array($environment, ['studio', 'concert_hall'])) {
+            $score += 0.5; // High quality = more processing
+        }
+        
+        return min($score, 5.0); // Cap at 5.0 for max 8x multiplier
+    }
+
+    /**
+     * Record generation request with generation link
+     */
+    protected function recordGenerationRequest(array $params, array $requestData, Generation $generation): GenerationRequest
     {
         return GenerationRequest::create([
             'user_id' => $params['user_id'] ?? null,
             'endpoint_used' => 'v3_music',
-            'request_payload' => $requestData,
+            'request_payload' => array_merge($requestData, [
+                'generation_id' => $generation->generation_id,
+                'mode' => $generation->mode
+            ]),
             'status' => 'initiated',
             'device_id' => $params['device_id'] ?? null,
             'ip_address' => $params['ip_address'] ?? null,
@@ -135,167 +202,24 @@ class MusicGenerationService extends TopMediaiBaseService
     }
 
     /**
-     * Create generated content record
+     * Handle successful TopMediai response (status 200) - PHASE 2 Enhanced
      */
-    protected function createGeneratedContent(array $params, array $response, GenerationRequest $generationRequest): GeneratedContent
-    {
-        // Extract task ID from various possible response keys
-        $taskId = $response['task_id'] ?? $response['id'] ?? $response['taskId'] ?? $response['request_id'] ?? null;
-        
-        return GeneratedContent::create([
-            'user_id' => $params['user_id'] ?? null,
-            'title' => $params['title'] ?? $this->generateTitle($params['prompt']),
-            'content_type' => $params['content_type'] ?? 'song',
-            'topmediai_task_id' => $taskId ?? 'unknown_' . uniqid(),  // Fallback ID if no task_id
-            'status' => 'pending',  // Always use 'pending' as it's a valid enum value
-            'prompt' => $params['prompt'],
-            'mood' => $params['mood'] ?? null,
-            'genre' => $params['genre'] ?? null,
-            'instruments' => isset($params['instruments']) ? $params['instruments'] : null,
-            'language' => $params['language'] ?? 'english',
-            'duration' => $params['duration'] ?? null,
-            'metadata' => $response,  // Store the full response for debugging
-            'started_at' => now(),
-            'is_premium_generation' => $params['is_premium'] ?? false,
-        ]);
-    }
-
-    /**
-     * Generate a title from the prompt
-     */
-    protected function generateTitle(string $prompt): string
-    {
-        // Simple title generation from prompt
-        $title = ucwords(strtolower($prompt));
-        
-        // Limit to 50 characters
-        if (strlen($title) > 50) {
-            $title = substr($title, 0, 47) . '...';
-        }
-
-        return $title;
-    }
-
-    /**
-     * Check if user can generate music (quota/subscription check)
-     */
-    public function canUserGenerate(int $userId): array
-    {
-        $user = AiMusicUser::find($userId);
-        if (!$user) {
-            return [
-                'can_generate' => false,
-                'reason' => 'User not found'
-            ];
-        }
-
-        // Check subscription status
-        if ($user->subscription_status === 'premium') {
-            return [
-                'can_generate' => true,
-                'reason' => 'Premium user - unlimited generations'
-            ];
-        }
-
-        // Check free tier limits
-        $freeLimit = config('topmediai.subscription.free_tier_limit', 10);
-        
-        if ($user->usage_count >= $freeLimit) {
-            return [
-                'can_generate' => false,
-                'reason' => 'Free tier limit exceeded',
-                'current_usage' => $user->usage_count,
-                'limit' => $freeLimit
-            ];
-        }
-
-        return [
-            'can_generate' => true,
-            'reason' => 'Within free tier limits',
-            'current_usage' => $user->usage_count,
-            'limit' => $freeLimit,
-            'remaining' => $freeLimit - $user->usage_count
-        ];
-    }
-
-    /**
-     * Increment user usage count
-     */
-    public function incrementUsage(int $userId): void
-    {
-        $user = AiMusicUser::find($userId);
-        if ($user) {
-            $user->increment('usage_count');
-            $user->increment('monthly_usage');
-            $user->update(['last_active_at' => now()]);
-        }
-    }
-
-    /**
-     * Get user's generation history
-     */
-    public function getUserGenerations(int $userId, int $limit = 20): array
-    {
-        $generations = GeneratedContent::where('user_id', $userId)
-            ->orderBy('created_at', 'desc')
-            ->limit($limit)
-            ->get();
-
-        return $generations->map(function ($generation) {
-            return [
-                'id' => $generation->id,
-                'title' => $generation->title,
-                'content_type' => $generation->content_type,
-                'status' => $generation->status,
-                'prompt' => $generation->prompt,
-                'mood' => $generation->mood,
-                'genre' => $generation->genre,
-                'duration' => $generation->duration,
-                'content_url' => $generation->content_url,
-                'thumbnail_url' => $generation->thumbnail_url,
-                'created_at' => $generation->created_at,
-                'completed_at' => $generation->completed_at,
-            ];
-        })->toArray();
-    }
-
-    /**
-     * Get generation statistics for user
-     */
-    public function getUserStats(int $userId): array
-    {
-        $user = AiMusicUser::find($userId);
-        if (!$user) {
-            return [];
-        }
-
-        $totalGenerations = GeneratedContent::where('user_id', $userId)->count();
-        $completedGenerations = GeneratedContent::where('user_id', $userId)
-            ->where('status', 'completed')->count();
-        $failedGenerations = GeneratedContent::where('user_id', $userId)
-            ->where('status', 'failed')->count();
-
-        return [
-            'total_generations' => $totalGenerations,
-            'completed_generations' => $completedGenerations,
-            'failed_generations' => $failedGenerations,
-            'success_rate' => $totalGenerations > 0 ? round(($completedGenerations / $totalGenerations) * 100, 2) : 0,
-            'subscription_status' => $user->subscription_status,
-            'usage_count' => $user->usage_count,
-            'monthly_usage' => $user->monthly_usage,
-            'last_active_at' => $user->last_active_at,
-        ];
-    }
-
-    /**
-     * Handle successful TopMediai response (status 200)
-     */
-    protected function handleSuccessfulResponse(array $response, GenerationRequest $generationRequest, array $params): array
+    protected function handleSuccessfulResponse(array $response, GenerationRequest $generationRequest, array $params, Generation $generation): array
     {
         // Extract task IDs from the response data
         $taskIds = [];
         if (isset($response['data']['ids']) && is_array($response['data']['ids'])) {
             $taskIds = $response['data']['ids'];
+        }
+
+        // REQUIREMENTS: Always expect exactly 2 task IDs
+        if (count($taskIds) !== 2) {
+            Log::warning('TopMediai returned unexpected number of task IDs', [
+                'expected' => 2,
+                'actual' => count($taskIds),
+                'task_ids' => $taskIds,
+                'generation_id' => $generation->generation_id
+            ]);
         }
 
         // Store the task IDs in the generation request
@@ -310,153 +234,365 @@ class MusicGenerationService extends TopMediaiBaseService
             'response_received_at' => now(),
         ]);
 
-        // Create generated content record
-        $generatedContent = $this->createGeneratedContentFromSuccess($params, $response, $generationRequest, $taskIds);
+        // PHASE 2: Create 2 generated content records linked to generation
+        $generatedContents = $this->createTaskRecords($generation, $taskIds, $params, $response);
 
         Log::info('Music generation started successfully', [
-            'generation_request_id' => $generationRequest->id,
-            'generated_content_id' => $generatedContent->id,
+            'generation_id' => $generation->generation_id,
+            'mode' => $generation->mode,
             'task_ids' => $taskIds,
-            'task_count' => count($taskIds)
+            'task_count' => count($taskIds),
+            'content_ids' => $generatedContents->pluck('id')->toArray()
         ]);
 
+        // REQUIREMENTS: Return exact format specified with thumbnail data
         return [
             'success' => true,
-            'message' => 'Music generation started successfully!',
+            'message' => 'Music generation started successfully',
             'data' => [
-                'task_ids' => $taskIds,
-                'generation_id' => $generationRequest->id,
-                'content_id' => $generatedContent->id,
-                'estimated_time' => $this->getEstimatedTime(),
-                'status' => 'processing'
+                'generation_id' => $generation->id, // Use numeric ID for frontend
+                'task_ids' => $taskIds, // Exactly 2 task IDs
+                'estimated_time' => '2-3 minutes',
+                'status' => 'processing',
+                'content_type' => 'song',
+                'songs' => $generatedContents->map(function ($content) {
+                    return [
+                        'id' => $content->id,
+                        'task_id' => $content->topmediai_task_id,
+                        'title' => $content->title,
+                        'status' => $content->status,
+                        'content_url' => null, // Not available yet
+                        'streaming_url' => null, // Not available yet
+                        'thumbnail_url' => null, // TopMediai thumbnail not available yet
+                        'custom_thumbnail_url' => $content->custom_thumbnail_url, // Will be null initially
+                        'best_thumbnail_url' => $content->getBestThumbnailUrl(), // Will be null initially
+                        'thumbnail_status' => $content->thumbnail_generation_status, // Will be 'pending'
+                        'thumbnail_info' => [
+                            'status' => $content->thumbnail_generation_status,
+                            'is_generating' => $content->isThumbnailGenerating(),
+                            'has_custom' => $content->hasCustomThumbnail(),
+                            'has_failed' => $content->hasThumbnailFailed(),
+                            'retry_count' => $content->thumbnail_retry_count,
+                            'completed_at' => $content->thumbnail_completed_at,
+                        ],
+                        'created_at' => $content->created_at->toISOString(),
+                    ];
+                })->toArray()
             ]
         ];
     }
 
     /**
-     * Handle TopMediai error response (non-200 status)
+     * PHASE 2: Create task records (2 tasks per generation)
+     */
+    protected function createTaskRecords(Generation $generation, array $taskIds, array $params, array $response): \Illuminate\Support\Collection
+    {
+        $contents = collect();
+
+        foreach ($taskIds as $index => $taskId) {
+            $content = GeneratedContent::create([
+                'user_id' => $generation->user_id,
+                'generation_id' => $generation->id, // Link to generation
+                'title' => $this->titleService->generateTitle($params, $generation->mode, $index + 1),
+                'content_type' => $generation->mode === 'instrumental' ? 'instrumental' : 'song',
+                'topmediai_task_id' => $taskId,
+                'status' => 'pending',
+                'prompt' => $params['prompt'] ?? $params['lyrics'] ?? '',
+                'mood' => $params['mood'] ?? null,
+                'genre' => $params['genre'] ?? null,
+                'instruments' => $params['instruments'] ?? null,
+                'language' => $params['language'] ?? 'english',
+                'duration' => $params['duration'] ?? null,
+                // Add thumbnail fields
+                'thumbnail_generation_status' => 'pending',
+                'thumbnail_retry_count' => 0,
+                'metadata' => [
+                    'generation_id' => $generation->generation_id,
+                    'mode' => $generation->mode,
+                    'task_index' => $index + 1,
+                    'topmediai_response' => $response,
+                    'generation_request_id' => $generationRequest->id ?? null,
+                    'auto_status_check_enabled' => true,
+                    'job_scheduled_at' => now()->toISOString()
+                ],
+                'started_at' => now(),
+                'is_premium_generation' => $params['is_premium'] ?? false,
+            ]);
+
+            // TASK 2: Schedule automatic status checking for this task
+            $this->scheduleStatusCheck($taskId, $content->id);
+            
+            // 🎯 OPTION A: Generate thumbnail immediately when music starts processing
+            $this->scheduleThumbnailGeneration($content, $params);
+
+            $contents->push($content);
+        }
+
+        return $contents;
+    }
+
+    /**
+     * TASK 2: Schedule automatic status checking for a task
+     */
+    protected function scheduleStatusCheck(string $taskId, int $contentId): void
+    {
+        Log::info('Scheduling automatic status check', [
+            'task_id' => $taskId,
+            'content_id' => $contentId,
+            'initial_delay' => '30 seconds'
+        ]);
+
+        try {
+            // Schedule the first status check for 30 seconds from now (aggressive detection)
+            CheckTaskStatusJob::dispatch($taskId)
+                ->delay(now()->addSeconds(30));
+
+            Log::info('Status check job scheduled successfully', [
+                'task_id' => $taskId,
+                'content_id' => $contentId,
+                'scheduled_for' => now()->addSeconds(30)->toISOString()
+            ]);
+
+        } catch (Exception $e) {
+            Log::error('Failed to schedule status check job', [
+                'task_id' => $taskId,
+                'content_id' => $contentId,
+                'error' => $e->getMessage()
+            ]);
+            
+            // Don't throw exception - generation should still succeed
+            // Manual status checking will still work via API endpoints
+        }
+    }
+
+    /**
+     * Schedule thumbnail generation immediately when music generation starts
+     */
+    protected function scheduleThumbnailGeneration(GeneratedContent $content, array $params): void
+    {
+        $musicPrompt = $params['prompt'] ?? $params['lyrics'] ?? '';
+        $genre = $params['genre'] ?? null;
+        $mood = $params['mood'] ?? null;
+        
+        // Skip if no prompt available
+        if (empty($musicPrompt)) {
+            Log::warning('Skipping thumbnail generation: no prompt available', [
+                'content_id' => $content->id
+            ]);
+            return;
+        }
+        
+        try {
+            // Get task index from content metadata (1 or 2)
+            $taskIndex = ($content->metadata['task_index'] ?? 1);
+            
+            // Dispatch thumbnail generation job immediately with small delay
+            ThumbnailGenerationJob::dispatch($content->id, $musicPrompt, $genre, $mood, $taskIndex)
+                ->onQueue('thumbnails')
+                ->delay(now()->addSeconds(5)); // Small delay to avoid overwhelming Runware API
+                
+            Log::info('Thumbnail generation scheduled', [
+                'content_id' => $content->id,
+                'prompt' => $musicPrompt,
+                'genre' => $genre,
+                'mood' => $mood,
+                'task_index' => $taskIndex,
+                'scheduled_for' => now()->addSeconds(5)->toISOString()
+            ]);
+            
+        } catch (Exception $e) {
+            Log::error('Failed to schedule thumbnail generation job', [
+                'content_id' => $content->id,
+                'error' => $e->getMessage(),
+                'prompt' => $musicPrompt
+            ]);
+            
+            // Don't throw exception - music generation should still succeed
+            // Thumbnail can be retried manually later if needed
+        }
+    }
+
+    /**
+     * Handle TopMediai error response (non-200 status) - TASK 3: Enhanced Error Handling
      */
     protected function handleErrorResponse(array $response, GenerationRequest $generationRequest, int $topMediaiStatus): array
     {
-        // Map TopMediai error codes to user-friendly messages
-        $errorMessage = $this->getErrorMessage($topMediaiStatus);
-        $retryAfter = $this->getRetryDelay($topMediaiStatus);
+        // TASK 3: Use ErrorHandlingService for user-friendly messages
+        $errorResponse = $this->errorService->handleTopMediaiError($topMediaiStatus, $response, 'music_generation');
 
-        // Update generation request with error
+        // Update generation request with enhanced error details
         $generationRequest->update([
             'response_data' => $response,
             'status' => 'failed',
             'error_message' => $response['message'] ?? 'TopMediai API error',
-            'error_code' => (string)$topMediaiStatus,
+            'error_code' => $errorResponse['error_code'],
             'request_sent_at' => now(),
             'response_received_at' => now(),
         ]);
 
-        Log::warning('Music generation failed - TopMediai error', [
+        Log::warning('Music generation failed - TopMediai error (Enhanced)', [
             'generation_request_id' => $generationRequest->id,
             'topmediai_status' => $topMediaiStatus,
             'topmediai_message' => $response['message'] ?? 'Unknown error',
-            'user_message' => $errorMessage
+            'error_code' => $errorResponse['error_code'],
+            'category' => $errorResponse['category'],
+            'user_message' => $errorResponse['message']
         ]);
 
-        return [
-            'success' => false,
-            'message' => $errorMessage,
-            'error_code' => 'GENERATION_FAILED',
-            'retry_after' => $retryAfter
-        ];
+        // Return enhanced error response with all user-friendly details
+        return $errorResponse;
     }
 
     /**
-     * Handle exception during API call
+     * Handle exception during API call - TASK 3: Enhanced Error Handling
      */
     protected function handleExceptionResponse(Exception $e, GenerationRequest $generationRequest, array $params): array
     {
-        // Update generation request with exception
+        // TASK 3: Use ErrorHandlingService for context-aware exception handling
+        $errorResponse = $this->errorService->handleException($e, 'music_generation', [
+            'user_id' => $params['user_id'] ?? null,
+            'generation_request_id' => $generationRequest->id,
+            'device_id' => $params['device_id'] ?? null
+        ]);
+
+        // Update generation request with enhanced error details
         $generationRequest->update([
             'status' => 'failed',
             'error_message' => $e->getMessage(),
+            'error_code' => $errorResponse['error_code'],
             'response_received_at' => now(),
         ]);
 
-        Log::error('Music generation failed - Exception', [
+        Log::error('Music generation failed - Exception (Enhanced)', [
             'user_id' => $params['user_id'] ?? null,
             'generation_request_id' => $generationRequest->id,
+            'error_code' => $errorResponse['error_code'],
+            'category' => $errorResponse['category'],
+            'exception_type' => get_class($e),
             'error' => $e->getMessage(),
-            'trace' => $e->getTraceAsString()
+            'user_message' => $errorResponse['message']
         ]);
 
+        // Return enhanced error response with user-friendly details
+        return $errorResponse;
+    }
+
+    // TASK 3: getRetryDelay method removed - now handled by ErrorHandlingService
+
+    /**
+     * Check if user can generate music (credit-based check)
+     */
+    public function canUserGenerate(int $userId): array
+    {
+        $user = AiMusicUser::find($userId);
+        if (!$user) {
+            return [
+                'can_generate' => false,
+                'reason' => 'User not found'
+            ];
+        }
+
+        $totalCredits = $user->totalCredits();
+        
+        if ($totalCredits <= 0) {
+            return [
+                'can_generate' => false,
+                'reason' => 'No credits remaining',
+                'subscription_credits' => $user->subscription_credits,
+                'addon_credits' => $user->addon_credits,
+                'total_credits' => $totalCredits,
+                'has_active_subscription' => $user->hasActiveSubscription()
+            ];
+        }
+
         return [
-            'success' => false,
-            'message' => 'Unable to connect to music generation service. Please try again.',
-            'error_code' => 'CONNECTION_FAILED',
-            'retry_after' => 60
+            'can_generate' => true,
+            'reason' => 'Sufficient credits available',
+            'subscription_credits' => $user->subscription_credits,
+            'addon_credits' => $user->addon_credits,
+            'total_credits' => $totalCredits,
+            'has_active_subscription' => $user->hasActiveSubscription()
         ];
     }
 
     /**
-     * Create generated content record for successful response
+     * Decrement user credits after successful generation
      */
-    protected function createGeneratedContentFromSuccess(array $params, array $response, GenerationRequest $generationRequest, array $taskIds): GeneratedContent
+    public function decrementUserCredits(int $userId, int $amount = 1): bool
     {
-        // Use the first task ID as the primary ID, or create a combined ID
-        $primaryTaskId = !empty($taskIds) ? $taskIds[0] : 'unknown_' . uniqid();
-        
-        return GeneratedContent::create([
-            'user_id' => $params['user_id'] ?? null,
-            'title' => $params['title'] ?? $this->generateTitle($params['prompt']),
-            'content_type' => $params['content_type'] ?? 'song',
-            'topmediai_task_id' => $primaryTaskId,
-            'status' => 'pending',
-            'prompt' => $params['prompt'],
-            'mood' => $params['mood'] ?? null,
-            'genre' => $params['genre'] ?? null,
-            'instruments' => isset($params['instruments']) ? $params['instruments'] : null,
-            'language' => $params['language'] ?? 'english',
-            'duration' => $params['duration'] ?? null,
-            'metadata' => [
-                'all_task_ids' => $taskIds,
-                'topmediai_response' => $response,
-                'generation_request_id' => $generationRequest->id
-            ],
-            'started_at' => now(),
-            'is_premium_generation' => $params['is_premium'] ?? false,
-        ]);
+        $user = AiMusicUser::find($userId);
+        if (!$user) {
+            return false;
+        }
+
+        if ($user->decrementCredits($amount)) {
+            $user->update(['last_active_at' => now()]);
+            return true;
+        }
+
+        return false;
     }
 
     /**
-     * Get user-friendly error message based on TopMediai status code
+     * Increment user usage count (backward compatibility - deprecated)
      */
-    protected function getErrorMessage(int $statusCode): string
+    public function incrementUsage(int $userId): void
     {
-        return match($statusCode) {
-            400015 => 'Unable to generate music at the moment. Please try again later.',
-            401 => 'Authentication failed. Please try again.',
-            403 => 'Access denied. Please check your subscription.',
-            429 => 'Too many requests. Please wait a moment before trying again.',
-            500, 502, 503 => 'Music generation service is temporarily unavailable. Please try again.',
-            default => 'Unable to generate music at the moment. Please try again.'
-        };
+        // For backward compatibility, treat as 1 credit decrement
+        $this->decrementUserCredits($userId, 1);
     }
 
     /**
-     * Get retry delay in seconds based on error type
+     * Get user's generation history
      */
-    protected function getRetryDelay(int $statusCode): int
+    public function getUserGenerations(int $userId, int $limit = 20): array
     {
-        return match($statusCode) {
-            400015 => 300,  // 5 minutes for insufficient balance
-            429 => 120,     // 2 minutes for rate limiting
-            500, 502, 503 => 180,  // 3 minutes for server errors
-            default => 60   // 1 minute for other errors
-        };
+        $generations = Generation::where('user_id', $userId)
+            ->with('tasks')
+            ->orderBy('created_at', 'desc')
+            ->limit($limit)
+            ->get();
+
+        return $generations->map(function ($generation) {
+            return [
+                'generation_id' => $generation->generation_id,
+                'mode' => $generation->mode,
+                'status' => $generation->status,
+                'task_count' => $generation->tasks->count(),
+                'completed_tasks' => $generation->tasks->where('status', 'completed')->count(),
+                'created_at' => $generation->created_at,
+                'estimated_time' => $generation->estimated_time,
+            ];
+        })->toArray();
     }
 
     /**
-     * Get estimated completion time for music generation
+     * Get generation statistics for user
      */
-    protected function getEstimatedTime(): string
+    public function getUserStats(int $userId): array
     {
-        return '2-3 minutes';
+        $user = AiMusicUser::find($userId);
+        if (!$user) {
+            return [];
+        }
+
+        $totalGenerations = Generation::where('user_id', $userId)->count();
+        $completedGenerations = Generation::where('user_id', $userId)
+            ->where('status', 'completed')->count();
+        $failedGenerations = Generation::where('user_id', $userId)
+            ->where('status', 'failed')->count();
+
+        return [
+            'total_generations' => $totalGenerations,
+            'completed_generations' => $completedGenerations,
+            'failed_generations' => $failedGenerations,
+            'success_rate' => $totalGenerations > 0 ? round(($completedGenerations / $totalGenerations) * 100, 2) : 0,
+            'subscription_credits' => $user->subscription_credits,
+            'addon_credits' => $user->addon_credits,
+            'total_credits' => $user->totalCredits(),
+            'has_active_subscription' => $user->hasActiveSubscription(),
+            'subscription_expires_at' => $user->subscription_expires_at,
+            'last_active_at' => $user->last_active_at,
+        ];
     }
 }

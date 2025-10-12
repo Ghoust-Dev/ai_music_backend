@@ -12,7 +12,10 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        //
+        // Register custom middleware aliases
+        $middleware->alias([
+            'verify.revenuecat.webhook' => \App\Http\Middleware\VerifyRevenueCatWebhook::class,
+        ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         //
